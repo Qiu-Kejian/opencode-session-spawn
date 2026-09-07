@@ -43,6 +43,8 @@ cp -r index.js package.json "$HOME/.config/opencode/plugins/session-relay/"
 
 > 变更流程：**在项目改 → 跑测试 → 复制回配置目录 → 重启桌面版**。
 > ⚠️ 同步必须**同时包含 `index.js` 和 `package.json`**（版本号/描述与 index.js 一起演进，2026-08-27 曾漏同步 package.json 导致生产停留在 1.0.3）。同步后跑一次 `node test/test.mjs` 确认哈希一致（生产版验证：`RELAY_MAIN=<生产路径> node test/test.mjs`）。
+>
+> **发布流程（验证通过后）**：项目自测全绿 → `index.js`+`package.json` 成对同步生产 → `RELAY_MAIN=<生产路径> node test/test.mjs` 回归全绿 → 重启桌面版会话内 `@relay verify` 通过 → commit → push → `npm publish`（**不打 git tag**；发布前 `npm whoami` 确认登录态，凭据不入库）。详见 `AGENTS.md`。
 
 ## 开发与测试
 
