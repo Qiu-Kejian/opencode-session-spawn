@@ -3,23 +3,22 @@ import { join, dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 
 /**
- * session-relay —— 会话接力赛跑（半自动 + 全自动）
+ * session-relay —— 会话接力赛跑（纯手动触发交接）
  *
- * 核心语义（2026-08-27 定稿）：
- *   - 「所有会话」不是全局所有会话，而是同一条接力链内的相关会话。
- *   - 决策时机：某会话即将压缩且尚未归属任何 relay 链时，toast 提示用户决策（压缩 or 交接）。
- *     - 「压缩」→ 走原生压缩；「交接」→ 为该会话创建一条 relay 链，链内全部会话自动交接，不再询问。
- *     - 决策提示已降噪：每会话压缩时仅在首次强提醒，后续压缩轻提醒（不锁死，可随时回「进入接力模式」切换）。
- *   - 链识别：交接时生成唯一 chainId，内嵌于交接语与注入消息；新会话据此归同链自动接力。链间互不影响。
+ * 核心语义（2026-08-28 重构定稿 · 链 SR-ee4810cd）：
+ *   - 交接与 opencode 压缩机制【彻底解耦】：不监听/不干预压缩钩子（compacting / compressed），
+ *     压缩原样交给 opencode，本插件零影响（无决策弹窗/无提醒/无计数）。
+ *   - 触发：用户手动发 `下一棒`/`relay next`/`@relay handoff` 才交接。流程（两阶段）：
+ *       Phase A：seedDoc 落盘骨架 + 挂 pendingHandoffs，引导当前会话模型把文书用 Write 补成成品（研发交接版）；
+ *       Phase B：文书为成品后（会话空闲 event.session.idle，或用户回复哨兵兜底）→ create 新会话 → 注入交接引导语。
+ *   - 链识别：交接时生成唯一 chainId，内嵌于交接语与注入消息；新会话据此归同链继续接力。链间互不影响。
  *
- * v3（2026-08-27 卍解）全自动：Phase B 主通道由 `event.session.idle` 触发（模型写完文书后自动建会话+注入，用户无需回复哨兵）；
- *   【保留兜底】聊天消息哨兵 `[RELAY_HANDOFF_DONE]` 仍在，全自动偶发未触发时可手动触发。
+ * 命令：`@relay handoff`（交接）/ `@relay status` / `@relay leave` / `@relay refresh` / `@relay verify`。
  *
- * v2（2026-08-27）优化：
- *   - 全自动链路正确性：时序握手（新会话明确 sleep+重试读文书）、部分失败分离（create成功但注入失败→保留已建会话并告警，
- *     不产生重复会话；create失败→完整降级半自动）、create 返回结构校验（避免 id=undefined 空会话）。
- *   - 状态可感知：`@relay status` / `@relay leave` 命令；决策提示降噪。
- *   - 通用性：路径用 join() 跨平台；relayPrompt 模板函数化、去硬编码项目路径；异常双通道（console+toast）。
+ * 历史沿革（勿回退）：
+ *   - v1-v3：曾绑定压缩临界自动交接（client.question 弹框 / compacting Phase A / session.idle 全自动）。
+ *   - 2026-08-28：用户定稿——插件 client 无 question 方法、压缩临界模型 tools:{} 调不了，「压缩→自动交接」结构性不可靠 →
+ *     彻底废弃压缩耦合，改为纯手动 `@relay handoff`。
  */
 
 function statePath(directory) {
@@ -36,18 +35,14 @@ function loadState(directory) {
         chains: data.chains || {},
         // sessionChain: { [sessionID]: chainId }
         sessionChain: data.sessionChain || {},
-        // counts: { [sessionID]: 压缩次数 }
-        counts: data.counts || {},
-        // reminded: [ {sessionID} 已做过首次强提醒 ]
-        reminded: data.reminded || [],
-        // pendingHandoffs: { [sessionID]: { cid, docPath, docNumber } }（两阶段 v3：Phase A 挂起，哨兵触发 Phase B）
+        // pendingHandoffs: { [sessionID]: { cid, docPath, docNumber } }（两阶段 v3：Phase A 挂起，Phase B 完成后清除）
         pendingHandoffs: data.pendingHandoffs || {},
       };
     }
   } catch {
     /* 状态文件损坏则重置 */
   }
-  return { chains: {}, sessionChain: {}, counts: {}, reminded: [], pendingHandoffs: {} };
+  return { chains: {}, sessionChain: {}, pendingHandoffs: {} };
 }
 
 function saveState(directory, state) {
@@ -172,13 +167,13 @@ export const SessionRelay = async (ctx) => {
 
   const chainOf = (state, sessionID) => state.sessionChain[sessionID] || null;
 
-  // ============ 两阶段全自动交接（2026-08-27 卍解 v3） ============
-  // 核心修复（用户 issue 1/2）：成品交接文书由旧会话模型写（经 output.prompt），必须「文书输出完成 → 再建新会话」。
-  //   Phase A（compacting 钩子）：seedDoc 骨架 + output.prompt 命令旧模型把成品文书写到精确路径，再回复 WITH 哨兵；
+  // ============ 两阶段交接（2026-08-27 卍解 v3，2026-08-28 定稿纯手动触发） ============
+  // 核心修复（用户 issue 1/2）：成品交接文书由旧会话模型写，必须「文书输出完成 → 再建新会话」。
+  //   Phase A（chat.message 触发：下一棒/relay next/@relay handoff）：seedDoc 骨架 + 挂 pending；
   //                             此时【不建会话】。pending 挂起在 state.pendingHandoffs[sessionID]。
-  //   Phase B（chat.message 捕获哨兵）：旧模型写完并回复哨兵 → 校验文书为成品（非骨架）→ create 新会话 →
-  //                             注入【真实交接语】（= 哨兵后的那段 work-handoff 交接语），清 pending。
-  // 手动 `@relay handoff` 也走两阶段：Phase A 提示写文书 → 当前会话回复哨兵 → phaseB 完成。
+  //   Phase B（event.session.idle 主通道 / chat.message 哨兵兜底）：模型写完文书 → 校验文书为成品（非骨架）→
+  //                             create 新会话 → 注入【真实交接语】（= 文书内「## 交接语」节或哨兵附带的交接语），清 pending。
+  // 与压缩机制完全无关：仅由用户手动触发。
   const HANDOFF_SENTINEL = "[RELAY_HANDOFF_DONE]";
 
   // 校验文书是否为「成品」：非骨架（已由模型用 Write 覆盖，去掉「由 session-relay 插件自动落盘」骨架标记）
@@ -192,8 +187,8 @@ export const SessionRelay = async (ctx) => {
     }
   }
 
-  // Phase A：准备文书 → 产出 sentinel 交接指令（本会话模型把文书补成成品并回复哨兵）。压缩与手动手动共用。
-  // 返回 { docPath, docNumber, sentinel: relayPromptInput }；不建会话。
+  // Phase A：准备文书 → 落盘骨架 + 挂 pending（本会话模型随后把文书补成成品）。纯手动触发（下一棒/@relay handoff）。
+  // 返回 { docPath, docNumber }；不建会话。
   async function phaseA_startHandoff(sessionID, cid) {
     const state = loadState(directory);
     const chain = state.chains[cid];
@@ -288,16 +283,8 @@ export const SessionRelay = async (ctx) => {
         const sessionID = event.properties?.sessionID;
         if (!sessionID) return;
 
-        if (event.type === "session.compacted") {
-          const state = loadState(directory);
-          state.counts[sessionID] = (state.counts[sessionID] || 0) + 1;
-          saveState(directory, state);
-          return;
-        }
-
-        // 全自动 Phase B（2026-08-27 卍解）：模型被 relayPrompt 指挥写完交接文书后，会话进入 idle →
-        // 自动校验成品并建会话+注入交接语，用户无需手动回复哨兵。pending 存在 + 文书为成品才触发。
-        // 兜底：若此处未触发（idle 事件缺失等），chat.message 的哨兵捕获仍可用。
+        // 仅处理 session.idle（Phase B 全自动主通道）。与压缩脱钩：不监听 compacted/compacting，
+        // 压缩事件原样交还 opencode，插件零干预。
         if (event.type === "session.idle") {
           const pending = (loadState(directory).pendingHandoffs || {})[sessionID];
           if (pending) {
@@ -311,7 +298,22 @@ export const SessionRelay = async (ctx) => {
       }
     },
 
-    // 捕获：1）新会话带链 token 归链；2）用户显式决策（交接/压缩）；3）@relay 命令
+    // 条件注入：仅 pendingHandoffs 存在本会话时，引导模型写文书（与压缩无关，零干扰）
+    "experimental.chat.system.transform": async ({ sessionID }, output) => {
+      try {
+        if (!sessionID || !output || !Array.isArray(output.system)) return;
+        const pending = (loadState(directory).pendingHandoffs || {})[sessionID];
+        if (pending) {
+          output.system.push(
+            `[会话接力] 插件已将交接文书骨架写入 ${pending.docPath}。请立即按项目 AGENTS.md「交接文档」规范，用 Write 工具撰写完整的研发交接文书并覆盖该文件（覆盖后骨架标记「由 session-relay 插件自动落盘」即消失）。完成后简单回复用户即可——插件将全自动创建接力会话并注入交接语。`.trim(),
+          );
+        }
+      } catch (e) {
+        console.error(`[session-relay] system.transform 处理失败: ${e.message}`);
+      }
+    },
+
+    // 捕获：1）两阶段 Phase B 哨兵兜底 / 下一棒触发；2）@relay 命令；3）新会话带链 token 归链；4）用户显式进入接力模式
     "chat.message": async ({ sessionID }, { parts }) => {
       try {
         const text = userText(parts);
@@ -330,6 +332,30 @@ export const SessionRelay = async (ctx) => {
           }
           // skipped（文书仍骨架）：已告警且未建会话 → 吞掉哨兵，避免当作普通消息
           if (b.skipped) return;
+        }
+
+        // 0.5) "下一棒" / "relay next" 触发（同 @relay handoff，与压缩无关）
+        if (/^下一棒$|^relay\s+next$/i.test(text.trim())) {
+          try {
+            let st = loadState(directory);
+            let cid = chainOf(st, sessionID);
+            if (!cid || !st.chains[cid]) {
+              cid = `SR-${randomUUID().slice(0, 8)}`;
+              st.chains[cid] = { docs: [], sessions: [sessionID], used: [] };
+              st.sessionChain[sessionID] = cid;
+              saveState(directory, st);
+            }
+            const r = await phaseA_startHandoff(sessionID, cid);
+            await notify(
+              "接力交接·第一步",
+              `骨架文书已写入 ${r.docPath}。即将自动补全为成品交接文书，完成后插件全自动创建接力会话。`,
+              "info",
+            );
+          } catch (e) {
+            console.error(`[session-relay] 下一棒触发失败: ${e.message}`);
+            await notify("接力交接", `交接失败: ${e.message}`, "error");
+          }
+          return;
         }
 
         // 3) @relay 命令族（状态/退链）
@@ -442,8 +468,9 @@ export const SessionRelay = async (ctx) => {
             return;
           }
           if (action === "handoff") {
-            // 手动触发全自动交接（两阶段 v3.1）：建链（若未归链）→ Phase A seedDoc + 本会话写成品文书 →
-            // 模型提示 → 用户回复哨兵 → chat.message 捕获（仅用户消息触发）→ Phase B 建会话 + 注入真实交接语。
+            // 手动触发交接（两阶段）：建链（若未归链）→ Phase A seedDoc 骨架 + 挂 pending →
+            // 当前会话模型把文书用 Write 补成成品 → 完成后（session.idle 或哨兵兜底）Phase B 建会话 + 注入引导语。
+            // 与压缩机制无关：仅由用户发 @relay handoff 触发。
             try {
               let st = loadState(directory);
               let cid = chainOf(st, sessionID);
@@ -455,8 +482,8 @@ export const SessionRelay = async (ctx) => {
               }
               const r = await phaseA_startHandoff(sessionID, cid);
               await notify(
-                "手动交接·第一阶段",
-                `请在文书 ${r.docPath} 里补全交接内容（须用 Write 覆盖取消骨架标记，见文书模板），写完后插件将全自动创建接力会话并注入交接语（session.idle 触发，无需操作）；若偶发未自动，可回复哨兵 ${HANDOFF_SENTINEL} 手动触发作兜底。`,
+                "手动交接·第一步",
+                `请在本会话把交接文书 ${r.docPath} 补成成品（须用 Write 覆盖消除骨架标记，见文书模板研发交接版）。补完后请让本会话模型回复哨兵 ${HANDOFF_SENTINEL}（或等待会话空闲自动触发）创建接力会话并注入引导语。`,
                 "warning",
               );
             } catch (e) {
@@ -471,7 +498,7 @@ export const SessionRelay = async (ctx) => {
               delete state.sessionChain[sessionID];
               state.chains[cid].sessions = (state.chains[cid].sessions || []).filter((s) => s !== sessionID);
               saveState(directory, state);
-              await notify("relay 退链", `本会话已退出链 ${cid}；下次压缩将重新提示决策。`);
+              await notify("relay 退链", `本会话已退出链 ${cid}；如需再次接力，回复「下一棒」即可重新建链。`);
             } else {
               await notify("relay 退链", "本会话未归属任何 relay 链，无需退出。");
             }
@@ -494,7 +521,7 @@ export const SessionRelay = async (ctx) => {
           return;
         }
         if (/进入接力|接力模式/.test(text)) {
-          // 2) 用户显式进入交接
+          // 2) 用户显式进入交接（与压缩脱钩：不等待任何压缩临界，立即生效）
           if (!chainOf(state, sessionID)) {
             const newCid = `SR-${randomUUID().slice(0, 8)}`;
             state.chains[newCid] = { docs: [], sessions: [sessionID], used: [] };
@@ -502,149 +529,15 @@ export const SessionRelay = async (ctx) => {
             saveState(directory, state);
             console.log(`[session-relay] 用户在该会话启用接力，新建链 ${newCid}`);
           }
-          await notify("会话接力模式", "本会话及后续交接出去的同链会话将自动接力，不再逐次询问。");
+          await notify("会话接力模式", "本会话已归属 relay 链：交接出去的会话将同链接力。");
           return;
-        }
-        if (/压缩模式|进入压缩|改用压缩|改为压缩/.test(text)) {
-          // 3) 用户显式选压缩：此会话不归 relay 链
-          if (chainOf(state, sessionID)) {
-            delete state.sessionChain[sessionID];
-            saveState(directory, state);
-          }
-          await notify("会话压缩模式", "本会话走原生压缩；下次压缩仍可再次决策是否切换接力。");
         }
       } catch (e) {
         console.error(`[session-relay] chat.message 处理失败: ${e.message}`);
         await notify("session-relay 错误", `chat.message 处理失败: ${e.message}`, "error");
       }
     },
-
-    // 初心弹框正路（2026-08-27 交接-1 结论）：压缩临界瞬间模型 tools:{} 无法弹框，
-    // 改为对「未归链」会话注入 system 指令，引导模型在对话中接近压缩时主动调 question 工具
-    // 弹「进入接力/直接压缩」多选框（question 框只有模型有工具时可达；建链复用 chat.message 的
-    // 「进入接力模式」正则）。已归链会话无需询问（自动交接），不注入。
-    "experimental.chat.system.transform": async ({ sessionID }, output) => {
-      try {
-        if (!sessionID || !output || !Array.isArray(output.system)) return;
-        const state = loadState(directory);
-        // 已归链：链内自动交接，无需提问 → 不注入
-        if (chainOf(state, sessionID)) return;
-        output.system.push(
-          `[会话接力] 本会话上下文可能接近压缩临界。当上下文已较满（例如出现自动续写/信息量大/接近上限）且本会话尚未进入接力时，请用 question 工具主动向用户弹出选择框，提交一个问题：
-问题：「本会话即将到达上下文上限。选择如何处理？」
-选项：1) 进入接力（建接力链，后续会话自动交接，避免上下文劣化）——选中后请提示用户回复「进入接力模式」以建立接力链；2) 直接压缩。
-只在本会话真正接近压缩边界时弹，避免打扰。本指令不要求你立即行动。`.trim(),
-        );
-      } catch (e) {
-        console.error(`[session-relay] system.transform 处理失败: ${e.message}`);
-      }
-    },
-
-    "experimental.session.compacting": async ({ sessionID }, output) => {
-      try {
-        if (!sessionID) return;
-
-        // [探针] 探测 client 是否有可阻塞提问的能力（桌面版实测）——调试用，仅 SESSION_RELAY_DEBUG=1 时输出，运行默认静默
-        try {
-          if (process.env.SESSION_RELAY_DEBUG === "1" && client && typeof client === "object") {
-            const ck = Object.keys(client).filter((k) => !k.startsWith("_"));
-            console.error(`[session-relay][probe] client keys: ${ck ? ck.join(",") : "(none)"}`);
-            console.error(`[session-relay][probe] client.question type: ${client.question ? typeof client.question : "(undefined)"}`);
-            if (client.tui) console.error(`[session-relay][probe] client.tui keys: ${Object.keys(client.tui).join(",")}`);
-            if (client && typeof client.question === "object") console.error(`[session-relay][probe] question obj keys: ${Object.keys(client.question).join(",")}`);
-          }
-        } catch (pe) {
-          console.error(`[session-relay][probe] 探测失败: ${pe.message}`);
-        }
-
-        const state = loadState(directory);
-        const cid = chainOf(state, sessionID);
-
-        if (cid && state.chains[cid]) {
-          const chain = state.chains[cid];
-          if (chain.used && chain.used.includes(sessionID)) {
-            // 本会话已交接。若最近一份文书缺失（交接断链：指针有、文件无），静默放行会丢上下文 → 改为告警而不是沉默。
-            const docs = chain.docs || [];
-            if (docs.length && !existsSync(docs[docs.length - 1])) {
-              console.error(`[session-relay] 检测到交接文书缺失（已 used 会话 ${sessionID} 的最近文书未落盘）: ${docs[docs.length - 1]}`);
-              await notify(
-                "会话接力·文书缺失",
-                `本会话已交接但其最近交接文书未落盘：${docs[docs.length - 1]}。请检查该文书是否存在，避免接手会话丢上下文；可在原会话重写补落盘。`,
-                "warning",
-              );
-            }
-            return; // 本会话已交接，放行压缩
-          }
-          // 已归链两阶段 Phase A：只准备文书 → compacting 返回后本会话模型执行 relayPrompt，把成品文书写完并回复哨兵。
-          // 建会话推迟到 chat.message 捕获哨兵的 Phase B（用户 issue 1：文书输出完成才建新会话）。
-          const r = await phaseA_startHandoff(sessionID, cid);
-          output.context = [];
-          // sentinelPrompt = relayPrompt 引导本会话写文书，并把交接语 + 哨兵作为最终回复（Phase B 据此建会话+注入真实交接语）
-          output.prompt = relayPrompt({
-            docPath: r.docPath, docNumber: r.docNumber, docs: r.docs, chainId: cid, sentinel: HANDOFF_SENTINEL,
-          });
-          return;
-        }
-
-        // 未归属 relay 链：压缩临界时标记本次压缩。toast/弹框在桌面版不可见，
-        // 决策采用纯文字交互：压缩照常进行；如想交接，随时回复「进入接力模式」即建链并转全自动接力。
-        try {
-          const askPath = join(directory, "handoff", ".relay-ask.json");
-          mkdirSync(join(directory, "handoff"), { recursive: true });
-          writeFileSync(askPath, JSON.stringify({ sessionID, scope: "compressing", createdAt: Date.now(), answered: false, answer: "" }, null, 2), "utf8");
-        } catch (fe) {
-          console.error(`[session-relay] 写待决策标记失败: ${fe.message}`);
-        }
-        await notify(
-          "会话接力·决策",
-          "本会话已到压缩临界。压缩照常进行；如需接力交接以免上下文劣化，请任意回复「进入接力模式」即可建链并转全自动交接。",
-          "warning",
-        );
-        return; // 放行本次压缩（决策走纯文字交互）
-      } catch (e) {
-        console.error(`[session-relay] compacting 处理失败（放行默认压缩）: ${e.message}`);
-        try {
-          await notify("session-relay 错误", `compacting 处理失败（已放行压缩）: ${e.message}`, "error");
-        } catch (_) {}
-      }
-    },
   };
 };
-
-// 历史文书索引
-function historyIndex(docs) {
-  if (!docs || !docs.length) return "   （本链暂无历史文书）";
-  return docs.map((p) => `   ${p}`).join("\n");
-}
-
-// 两阶段 v3：Phase A 不建会话。本会话模型先把成品文书写好，随后 event 钩子的 session.idle 监听
-// 全自动触发 Phase B（校验成品 → 建会话 → 注入交接语），用户【无需任何操作】。
-// 兜底：若 session.idle 偶发未触发，保留用户手动回复哨兵 [RELAY_HANDOFF_DONE] 的 chat.message 触发通道。
-function sentinelReply(docPath, docNumber, chainId, sentinel) {
-  return `【收尾（Phase B · 全自动触发）】
-交接文书写好（已用 Write 覆盖 ${docPath}，非骨架）后，向用户输出一句话提示：
-「交接文书已写好：${docPath}。插件将全自动创建接力会话并注入交接语，无需操作。若几秒后未见自动创建，可回复哨兵 ${sentinel} 手动触发。」
-【不要自行输出 ${sentinel}】——全自动由 session.idle 事件触发（会话空闲即建）。哨兵仅是兜底，正常情况不劳用户动手。插件会：校验文书为成品 → 创建接力会话 → 把交接语注入为新会话首条消息。`;
-}
-
-function relayPrompt({ docPath, docNumber, docs, chainId, sentinel }) {
-  const historyList = historyIndex(docs);
-  return `你是「会话接力」特使。当前会话上下文即将（首次）压缩。我们不执行这次会劣化上下文的常规压缩，而是改为产出接力交接物，让工作在新会话以完整、未劣化上下文干净续跑——本交接链（链标识 ${chainId}）内零压缩劣化。
-你的交接物是新会话唯一依赖的上下文（原始会话已冻结用于回溯），文书质量决定任务成败——务必抓重点、写硬核、宁具体勿模糊。
-
-【写作心法】
-- 读者是接手的执行助手，目标是「不重读原文也能接着干」。写可执行的研发交接单，非聊天总结。
-- 必要信息宁多写具体事实（file:line、提交号、接口路径、字段名、报错原文），不用"做了些改动"这类模糊话。
-- 放弃：闲聊、已解决中间过程、过期的临时调试细节、明文凭证（只写凭证所在文档位置）。
-
-【第一件事：写交接文书】
-按项目既有约定（项目根 AGENTS.md 的「交接文档（handoff）」规范 + work-handoff 技能模板）产出研发交接版 Markdown，写入精确路径 ${docPath}（不许改动路径，本链第 ${docNumber} 份文书，序号须保留，避免与同链历史文书撞名）。用 Write 工具写入，成功后回报「交接文书已写入: ${docPath}」。
-
-本链历史文书（回源索引）：
-${historyList}
-
-${sentinelReply(docPath, docNumber, chainId, sentinel)}
-`;
-}
 
 export default SessionRelay;
