@@ -95,6 +95,42 @@ section("A. 工具 spawn_session（create + promptAsync 注入）");
   ok("A5 返回值含「注入失败」", typeof r === "string" && r.includes("注入失败"));
 }
 
+{
+  // A6: 传 agent → promptAsync body.agent 命中
+  const { client, calls } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks.tool.spawn_session.execute({ prompt: "x", agent: "leader" }, ctx);
+  ok("A6 agent 透传 promptAsync body.agent", calls.promptAsync[0].body.agent === "leader");
+  ok("A6 传 agent 时 create 无 query", calls.create[0].query === undefined);
+}
+
+{
+  // A7: 传 directory → create query.directory 命中
+  const { client, calls } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks.tool.spawn_session.execute({ prompt: "x", directory: "D:\\dev\\bbcare" }, ctx);
+  ok("A7 directory 透传 create.query.directory", calls.create[0].query && calls.create[0].query.directory === "D:\\dev\\bbcare");
+  ok("A7 传 directory 时 promptAsync body 无 agent", calls.promptAsync[0].body.agent === undefined);
+}
+
+{
+  // A8: 均不传 → v2.0.0 形状（无 query / 无 agent）
+  const { client, calls } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks.tool.spawn_session.execute({ prompt: "x" }, ctx);
+  ok("A8 未传 directory → create 无 query", calls.create[0].query === undefined);
+  ok("A8 未传 agent → promptAsync body 无 agent", calls.promptAsync[0].body.agent === undefined);
+}
+
+{
+  // A9: agent/directory 空串或纯空白 → 等同未传
+  const { client, calls } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks.tool.spawn_session.execute({ prompt: "x", agent: "   ", directory: "" }, ctx);
+  ok("A9 空白 agent 视为未传", calls.promptAsync[0].body.agent === undefined);
+  ok("A9 空串 directory 视为未传", calls.create[0].query === undefined);
+}
+
 // ============ B. 人工命令 @spawn / @relay spawn ============
 section("B. 人工命令 @spawn（兼容 @relay spawn）");
 
@@ -135,6 +171,61 @@ section("B. 人工命令 @spawn（兼容 @relay spawn）");
   ok("B4 普通文本零 toast", toasts.length === 0);
 }
 
+{
+  // B5: @spawn --agent leader 干活
+  const { client, calls } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks["chat.message"]({ sessionID: "S" }, { parts: [{ type: "text", text: "@spawn --agent leader 干活" }] });
+  ok("B5 --agent → create 1次", calls.create.length === 1);
+  ok("B5 --agent=leader", calls.promptAsync[0].body.agent === "leader");
+  ok("B5 prompt=干活", calls.promptAsync[0].body.parts[0].text === "干活");
+}
+
+{
+  // B6: --title T --agent leader（顺序颠倒）
+  const { client, calls } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks["chat.message"]({ sessionID: "S" }, { parts: [{ type: "text", text: "@spawn --title 标题T --agent leader 起始语" }] });
+  ok("B6 顺序颠倒 agent 命中", calls.promptAsync[0].body.agent === "leader");
+  ok("B6 顺序颠倒 title 命中", calls.create[0].body.title === "标题T");
+  ok("B6 顺序颠倒 prompt 正确", calls.promptAsync[0].body.parts[0].text === "起始语");
+}
+
+{
+  // B7: 起始语句内含 --agent（非前导）→ 原样保留、不解析
+  const { client, calls } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks["chat.message"]({ sessionID: "S" }, { parts: [{ type: "text", text: "@spawn 跑任务 --agent leader" }] });
+  ok("B7 非前导 --agent 不解析", calls.promptAsync[0].body.agent === undefined);
+  ok("B7 非前导 --agent 原样保留", calls.promptAsync[0].body.parts[0].text === "跑任务 --agent leader");
+}
+
+{
+  // B8: @spawn --agent（缺值）→ warning 含用法、不建会话
+  const { client, calls, toasts } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks["chat.message"]({ sessionID: "S" }, { parts: [{ type: "text", text: "@spawn --agent" }] });
+  ok("B8 缺值不建会话", calls.create.length === 0);
+  ok("B8 缺值 warning 含用法", toasts.some((t) => t.variant === "warning" && /用法/.test(t.message)));
+}
+
+{
+  // B9: @relay spawn 兼容且无 flag
+  const { client, calls } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks["chat.message"]({ sessionID: "S" }, { parts: [{ type: "text", text: "@relay spawn 提示" }] });
+  ok("B9 @relay spawn → create 1次", calls.create.length === 1);
+  ok("B9 @relay spawn 无 agent", calls.promptAsync[0].body.agent === undefined);
+}
+
+{
+  // B10: --title 覆盖首行标题
+  const { client, calls } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks["chat.message"]({ sessionID: "S" }, { parts: [{ type: "text", text: "@spawn --title 覆盖标题 首行标题\n第二行" }] });
+  ok("B10 --title 覆盖首行标题", calls.create[0].body.title === "覆盖标题");
+}
+
 // ============ C. 回退与健壮性 ============
 section("C. promptAsync 缺失回退 / create 缺失");
 
@@ -155,6 +246,15 @@ section("C. promptAsync 缺失回退 / create 缺失");
   const r = await hooks.tool.spawn_session.execute({ prompt: "x" }, ctx);
   ok("C2 create 缺失 → 返回「创建会话失败」", typeof r === "string" && r.includes("创建会话失败"));
   ok("C2 create 缺失未注入", calls.promptAsync.length === 0);
+}
+
+{
+  // C3: 回退同步 prompt 同样透传 agent/directory
+  const { client, calls } = makeClient({ noPromptAsync: true });
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks.tool.spawn_session.execute({ prompt: "回退", agent: "leader", directory: "D:\\dev\\bbcare" }, ctx);
+  ok("C3 回退 prompt body.agent 命中", calls.prompt[0].body.agent === "leader");
+  ok("C3 回退 create query.directory 命中", calls.create[0].query && calls.create[0].query.directory === "D:\\dev\\bbcare");
 }
 
 // ============ D. 源码无旧机制残留 ============
