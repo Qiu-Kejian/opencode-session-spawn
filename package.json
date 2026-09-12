@@ -1,24 +1,22 @@
 {
-  "name": "opencode-session-relay",
-  "version": "1.3.2",
+  "name": "opencode-session-spawn",
+  "version": "2.0.0",
   "type": "module",
-  "description": "会话接力赛跑插件：压缩临界处理 + 进入接力模式决策交互 + 两阶段全自动交接（文书完成→session.idle自动建会话，按链分目录 + [N棒] 标题，哨兵兜底）",
+  "description": "opencode 会话生成原语：创建新顶层会话并注入起始语句，用于无人值守长任务编排（工具 spawn_session + 命令 @spawn）。",
   "main": "index.js",
   "files": [
     "index.js",
     "package.json",
     "README.md",
-    "LICENSE",
-    "docs/",
-    "examples/"
+    "LICENSE"
   ],
   "keywords": [
     "opencode",
     "plugin",
     "session",
-    "relay",
-    "handoff",
-    "compact"
+    "spawn",
+    "orchestration",
+    "unattended"
   ],
   "license": "MIT",
   "repository": {
@@ -28,5 +26,10 @@
   "engines": {
     "node": ">=18"
   },
-  "dependencies": {}
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.1.36"
+  }
 }
