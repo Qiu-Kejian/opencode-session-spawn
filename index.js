@@ -1,7 +1,7 @@
 import { tool } from "@opencode-ai/plugin/tool";
 
 /**
- * session-spawn —— 会话生成原语（v2.1.0，2026-09-12 起支持 agent/directory）
+ * session-spawn —— 会话生成原语（v2.1.1，2026-09-12 起支持 agent/directory）
  *
  * 只做一件事：创建一个新的顶层会话，并把起始语句注入为该会话首条消息。
  *   create: client.session.create({ body: { title }, query: { directory } })

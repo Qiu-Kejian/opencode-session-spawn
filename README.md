@@ -22,15 +22,17 @@ opencode 插件：**会话生成原语**。只做一件事——**创建一个�
 - 优先 `promptAsync`（异步 fire-and-forget，**不阻塞父会话**）；缺失则回退同步 `prompt`。
 - create 失败 → 不建会话；create 成功但注入失败 → **保留已建会话**并提示 id，不产生重复会话。
 
-## 安装（部署到桌面版）
+## 安装
 
-桌面版从用户配置目录加载活插件：
+在全局或项目 `opencode.json(c)` 的 `plugin` 数组注册包名，重启桌面版生效（opencode 自动拉取最新发布并装入包缓存）：
 
-```bash
-cp index.js package.json "$HOME/.config/opencode/plugins/session-relay/"
+```jsonc
+{
+  "plugin": ["opencode-session-spawn"]
+}
 ```
 
-在全局 `opencode.jsonc` 的 `plugin` 数组注册 `./plugins/session-relay`，重启桌面版生效。
+本地开发也可注册本地目录（opencode 按路径加载）：把 `index.js` + `package.json` 复制到自选目录，在 `plugin` 中写该目录相对路径（如 `./plugins/session-spawn`）。
 
 ## 编排示例
 
@@ -60,12 +62,12 @@ npm install          # 安装 devDependency @opencode-ai/plugin（唯一依赖�
 node test/test.mjs   # 23 用例 / 62 断言
 ```
 
-- `test/test.mjs` 默认经相对路径 `../index.js` 测项目版；环境变量 `RELAY_MAIN` 覆盖为其他路径（如生产活实例）。生产版从 `.config/opencode/node_modules` 解析 `@opencode-ai/plugin`。
+- `test/test.mjs` 默认经相对路径 `../index.js` 测项目版；环境变量 `RELAY_MAIN` 覆盖为其他路径（tarball 解包版 / 包缓存活实例）。`RELAY_MAIN` 目标须能向上解析到 `@opencode-ai/plugin`（解包放项目内即可）。
 - 以尾部 `==== 结果: N 通过, 0 失败 ====` 为准。
 
 ## 发布
 
-`index.js` + `package.json` 成对同步生产 → `RELAY_MAIN=<生产路径> node test/test.mjs` 回归全绿 → 重启桌面版实测 → commit → push → `npm publish`（不打 git tag；发布前 `npm whoami` 确认登录态，凭据不入库）。详见 `AGENTS.md`。
+bump 版本号（`package.json` 与 `index.js` 头注释同步）→ `node test/test.mjs` 全绿 → `npm pack` 解包核对哈希 + `RELAY_MAIN` 回归全绿 → commit → push → `npm publish`（不打 git tag；先 `npm whoami` 确认登录态，凭据不入库）→ 重启桌面版实测 `@spawn` / `spawn_session`；实测不过修复补丁重发。详见 `AGENTS.md`。
 
 ## 历史
 
