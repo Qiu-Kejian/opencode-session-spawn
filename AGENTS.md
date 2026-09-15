@@ -1,4 +1,4 @@
-# opencode-session-spawn 开发流水线（神圣约定，2026-09-07 立；2026-09-12 v2 简化；2026-09-13 对齐 npm 生产形态；2026-09-15 v2.3.0 metadata 父链接）
+# opencode-session-spawn 开发流水线（神圣约定，2026-09-07 立；2026-09-12 v2 简化；2026-09-13 对齐 npm 生产形态；2026-09-15 v2.3.0 metadata 父链接 / v2.4.0 创建后选中）
 
 > 所有改动走固定流水线：**开发（项目仓库）→ 自测 → 生产验证 → 发布上线**。
 > 项目目录 = `D:\dev\session-spawn`；生产实例 = npm 包 `opencode-session-spawn`（注册于公共层 `share/opencode.json`（挂载项目内即 `.opencode/opencode.json`）的 `plugin` 数组），opencode 将其装入包缓存 `C:\Users\qiu_k\.cache\opencode\packages\opencode-session-spawn@latest\node_modules\opencode-session-spawn`，重启桌面版后生效。
@@ -8,7 +8,7 @@
 | 阶段 | 动作 | 位置 |
 |------|------|------|
 | 1 开发 | 只改本项目文件（index.js / package.json / test / README），不直接改包缓存 | `D:\dev\session-spawn` |
-| 2 自测 | `node test/test.mjs` → 须 `==== 结果: 94 通过, 0 失败 ====`（39 用例 / 94 断言，以尾部汇总行为准） | 项目 |
+| 2 自测 | `node test/test.mjs` → 须 `==== 结果: 106 通过, 0 失败 ====`（46 用例 / 106 断言，以尾部汇总行为准） | 项目 |
 | 3 生产验证 | ① `npm pack`（tarball 即发布内容）→ 解包核对 `index.js` + `package.json` 与仓库哈希一致 ② `RELAY_MAIN=<解包目录>\package\index.js node test/test.mjs` 回归全绿 ③ 发布后重启桌面版 → 核对包缓存活实例哈希一致并 `RELAY_MAIN` 回归 → `@spawn <测试语句>` / `spawn_session` 实测建会话+注入成功 | 项目 + 包缓存 |
 | 4 发布上线 | 阶段 2、3①② 全过才可 commit → push → `npm publish`（**不打 git tag**）→ 重启桌面版做 3③ 上线实测；实测不过必须立即修复补丁重发，不得带病收工 | GitHub + npm |
 
@@ -24,7 +24,7 @@
 
 ```powershell
 npm install                                  # 安装 devDependency @opencode-ai/plugin（唯一依赖，仅测试用）
-node test/test.mjs                           # 项目版自测（39 用例 / 94 断言 A-H）
+node test/test.mjs                           # 项目版自测（46 用例 / 106 断言 A-I）
 
 # 发布前：验证 tarball（npm pack 产物即发布内容；解包须放项目内以解析 @opencode-ai/plugin）
 npm pack                                     # 产出 opencode-session-spawn-<版本>.tgz
@@ -43,9 +43,10 @@ npm whoami; npm publish                      # 版本号已随阶段 3 前 bump 
 - 解包位置必须在项目内（或任何可向上解析到 `node_modules` 的目录），否则 `@opencode-ai/plugin` 解析失败。
 - 有意构造的失败用例（CREATE_FAIL/PROMPT_FAIL）在自身断言内被捕获，不产生尾部 `[FAIL]`。
 
-## 架构（v2.3.0）
+## 架构（v2.4.0）
 
-- 唯一职责：`client.session.create({ body:{ title, metadata?:{ spawnParentID }, model? }, query:{ directory } })` → `client.session.promptAsync({ path:{ id }, body:{ agent, parts:[{type:'text',text}] } })`（agent/directory/model 可选，仅非空白时透传，交服务端校验）。
+- 唯一职责：`client.session.create({ body:{ title, metadata?:{ spawnParentID }, model? }, query:{ directory } })` →（可选）`client.tui.selectSession({ sessionID })` → `client.session.promptAsync({ path:{ id }, body:{ agent, parts:[{type:'text',text}] } })`（agent/directory/model 可选，仅非空白时透传，交服务端校验）。
 - **父链接写 `metadata.spawnParentID`（不写 `parentID`）**：写 parentID 会让新会话变成子会话、从桌面端会话列表消失，且子会话默认不能再开 `task` 子代理（破坏编排）；`notify_parent` 沿 metadata 上行并兼容旧 `parentID` 回退。
-- 入口：工具 `spawn_session({ prompt, title?, agent?, directory?, model? })`（模型自主）+ 命令 `@spawn [--agent <名称>] [--title <标题>] <起始语句>`（人工，兼容 `@relay spawn`）。
+- **创建后默认选中新会话**：`select`（默认 true；`@spawn --no-select` 关闭）→ `tui.selectSession`，缺失回退 `tui.publish({ type:"tui.session.select", properties:{ sessionID } })`；失败忽略。TUI 即时生效；桌面端 app 未消费该事件（上游 issue #45963），当前 no-op。
+- 入口：工具 `spawn_session({ prompt, title?, agent?, directory?, model?, select? })`（模型自主）+ 命令 `@spawn [--agent <名称>] [--title <标题>] [--no-select] <起始语句>`（人工，兼容 `@relay spawn`）。
 - 不落/不读文书、不追踪链、无状态文件；交接文书引导由调用方写进 `prompt`。

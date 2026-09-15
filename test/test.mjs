@@ -13,8 +13,8 @@ function ok(name, cond) {
 function section(t) { console.log(`\n== ${t} ==`); }
 
 // 假 client：记录 create / promptAsync / prompt / get 调用与 toast。
-function makeClient({ failCreate = false, failPrompt = false, noPromptAsync = false, noPrompt = false, noCreate = false, noGet = false, failGet = false, parentID = null, spawnParentID = "ses_parent_1" } = {}) {
-  const calls = { create: [], promptAsync: [], prompt: [], get: [] };
+function makeClient({ failCreate = false, failPrompt = false, noPromptAsync = false, noPrompt = false, noCreate = false, noGet = false, failGet = false, parentID = null, spawnParentID = "ses_parent_1", noTui = false, noSelectSession = false, noPublish = false, failSelect = false } = {}) {
+  const calls = { create: [], promptAsync: [], prompt: [], get: [], select: [], publish: [] };
   const toasts = [];
   const session = {
     create: noCreate ? undefined : async (opts) => {
@@ -39,7 +39,20 @@ function makeClient({ failCreate = false, failPrompt = false, noPromptAsync = fa
       return { data: {} };
     },
   };
-  return { client: { tui: { showToast: async (t) => toasts.push(t) }, session }, calls, toasts };
+  const tui = noTui ? undefined : {
+    showToast: async (t) => toasts.push(t),
+    selectSession: noSelectSession ? undefined : async (arg) => {
+      calls.select.push(arg);
+      if (failSelect) throw new Error("SELECT_FAIL");
+      return { data: true };
+    },
+    publish: noPublish ? undefined : async (arg) => {
+      calls.publish.push(arg);
+      if (failSelect) throw new Error("PUBLISH_FAIL");
+      return { data: true };
+    },
+  };
+  return { client: { tui, session }, calls, toasts };
 }
 
 const pluginPath = process.env.RELAY_MAIN || fileURLToPath(new URL("../index.js", import.meta.url));
@@ -430,6 +443,70 @@ section("H. spawn_session model 参数（provider/model）");
   const hooks = await SessionSpawn({ directory: ".", client });
   await hooks.tool.spawn_session.execute({ prompt: "x", model: "no-slash" }, ctx);
   ok("H4 非法 model（无 /）忽略", !("model" in calls.create[0].body));
+}
+
+// ============ I. 创建后选中新会话（tui.selectSession） ============
+section("I. 创建后选中新会话（select，默认开）");
+
+{
+  // I1: 默认 select → selectSession({ sessionID }) 命中新会话
+  const { client, calls } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks.tool.spawn_session.execute({ prompt: "x" }, ctx);
+  ok("I1 默认调用 selectSession", calls.select.length === 1);
+  ok("I1 selectSession sessionID = 新会话 id", calls.select[0] && calls.select[0].sessionID === "ses_new_1");
+}
+
+{
+  // I2: select:false → 不调用（selectSession / publish 均不调）
+  const { client, calls } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks.tool.spawn_session.execute({ prompt: "x", select: false }, ctx);
+  ok("I2 select:false 不调用 selectSession/publish", calls.select.length === 0 && calls.publish.length === 0);
+}
+
+{
+  // I3: selectSession 缺失 → 回退 publish（事件形状）
+  const { client, calls } = makeClient({ noSelectSession: true });
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks.tool.spawn_session.execute({ prompt: "x" }, ctx);
+  ok("I3 回退 publish 1次", calls.publish.length === 1);
+  ok("I3 publish type = tui.session.select", calls.publish[0] && calls.publish[0].type === "tui.session.select");
+  ok("I3 publish properties.sessionID = 新会话 id", calls.publish[0] && calls.publish[0].properties && calls.publish[0].properties.sessionID === "ses_new_1");
+}
+
+{
+  // I4: 两者皆无 → 不抛、spawn 正常返回
+  const { client } = makeClient({ noSelectSession: true, noPublish: true });
+  const hooks = await SessionSpawn({ directory: ".", client });
+  const r = await hooks.tool.spawn_session.execute({ prompt: "x" }, ctx);
+  ok("I4 无 select 能力不抛且返回正常", typeof r === "string" && r.includes("ses_new_1") && r.includes("已创建会话"));
+}
+
+{
+  // I5: selectSession 抛错 → spawn 返回不受影响
+  const { client, calls } = makeClient({ failSelect: true });
+  const hooks = await SessionSpawn({ directory: ".", client });
+  const r = await hooks.tool.spawn_session.execute({ prompt: "x" }, ctx);
+  ok("I5 select 抛错不影响返回", typeof r === "string" && r.includes("ses_new_1") && r.includes("已创建会话"));
+  ok("I5 select 已尝试", calls.select.length === 1);
+}
+
+{
+  // I6: @spawn --no-select → 不调用
+  const { client, calls } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks["chat.message"]({ sessionID: "S" }, { parts: [{ type: "text", text: "@spawn --no-select 不选中" }] });
+  ok("I6 @spawn --no-select 不调用", calls.select.length === 0 && calls.publish.length === 0);
+  ok("I6 prompt 正确", calls.promptAsync[0] && calls.promptAsync[0].body.parts[0].text === "不选中");
+}
+
+{
+  // I7: @spawn 默认 → 调用（人工语义同样默认选中）
+  const { client, calls } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks["chat.message"]({ sessionID: "S" }, { parts: [{ type: "text", text: "@spawn 默认选中" }] });
+  ok("I7 @spawn 默认调用 selectSession", calls.select.length === 1);
 }
 
 console.log(`\n==== 结果: ${pass} 通过, ${fail} 失败 ====`);
