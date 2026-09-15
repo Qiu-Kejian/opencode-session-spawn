@@ -1,14 +1,15 @@
 # opencode-session-spawn
 
-opencode 插件：**会话生成原语**。只做一件事——**创建一个新的顶层会话，并把起始语句注入为该会话的首条消息**。
+opencode 插件：**会话生成原语**。做两件事——**创建一个新的顶层会话，并把起始语句注入为该会话首条消息**；以及**子会话反向通知父会话**（`notify_parent`：注入一条 `[relay]` 消息并唤醒父会话）。
 
-它的用途是**无人值守长任务编排**：当一条任务超出单会话上下文时，当前会话的模型可以在需要时自行生成一段交接语句、调用工具开出一个新会话继续，新会话拿到语句立即开跑。插件不落文书、不读文书、不追踪链、无状态文件——需要交接文书时，把「读取某份文书路径」等引导写进起始语句即可，与其他工具天然兼容。
+它的用途是**无人值守长任务编排**：当一条任务超出单会话上下文时，当前会话的模型可以在需要时自行生成一段交接语句、调用工具开出一个新会话继续，新会话拿到语句立即开跑；子会话完成 / 受阻时可用 `notify_parent` 回调 spawn 它的会话。插件不落文书、不读文书、不追踪链、无状态文件——需要交接文书时，把「读取某份文书路径」等引导写进起始语句即可，与其他工具天然兼容。
 
-## 两个入口（共用同一实现）
+## 入口与工具
 
-| 入口 | 用法 | 谁触发 |
+| 入口 / 工具 | 用法 | 谁触发 |
 |------|------|--------|
 | 工具 `spawn_session` | `spawn_session({ prompt, title?, agent?, directory? })` | **模型自主调用**（打通无人值守） |
+| 工具 `notify_parent` | `notify_parent({ text })` | **子会话模型自主调用**（完成 / 受阻时回调父会话） |
 | 命令 | `@spawn [--agent <名称>] [--title <标题>] <起始语句>`（兼容 `@relay spawn`） | 人工触发 |
 
 参数 / 行为：
@@ -17,14 +18,16 @@ opencode 插件：**会话生成原语**。只做一件事——**创建一个�
 - `title`（可选）：新会话标题。缺省取 `prompt` 首行（清洗非法字符、截断 60）。
 - `agent`（可选，工具参数）：新会话以某 agent/模式启动（如 `leader`）。仅在传了非空白值时透传，交服务端校验。
 - `directory`（可选，工具参数）：新会话绑定的项目目录（如 `D:\dev\bbcare`）。仅在传了非空白值时透传，交服务端校验。
+- `parentID`（自动，非参数）：`spawn_session` 自动把调用者会话 id 写入新会话 `parentID`（`context.sessionID` 非空白时）；命令 `@spawn` 无会话上下文，不带 `parentID`。
 - 命令 flag 说明：`--agent` / `--title` 值均为**单个 token**（不处理引号/空格）；仅解析命令后**前导** flag，起始语句内部再出现的 `--xxx` 原样保留；flag 缺值或起始语句为空 → warning toast 且不建会话。`--title` 优先于起始语句首行。
-- 内部调用：`client.session.create({ body: { title }, query: { directory } })` → `client.session.promptAsync({ path: { id }, body: { agent, parts: [{ type: "text", text: prompt }] } })`；`agent` / `directory` 未传时不出现对应键。
+- 内部调用（spawn）：`client.session.create({ body: { title, parentID }, query: { directory } })` → `client.session.promptAsync({ path: { id }, body: { agent, parts: [{ type: "text", text: prompt }] } })`；`agent` / `directory` / `parentID` 未传时不出现对应键。
+- `notify_parent` 行为：仅能通知**父会话**（不提供任意 session id 参数）；`client.session.get` 解析自身 `parentID` 后，向父会话注入 `[relay] <text>` 并唤醒它；父会话以服务端默认模式（`build`）被唤醒；空文本 / 无父会话 / 读取或注入失败 → 返回错误文本（不抛）；无重试 / 队列 / 追踪（保持无状态原语）。
 - 优先 `promptAsync`（异步 fire-and-forget，**不阻塞父会话**）；缺失则回退同步 `prompt`。
 - create 失败 → 不建会话；create 成功但注入失败 → **保留已建会话**并提示 id，不产生重复会话。
 
-## 安装
+## 安装（部署到桌面版）
 
-在全局或项目 `opencode.json(c)` 的 `plugin` 数组注册包名，重启桌面版生效（opencode 自动拉取最新发布并装入包缓存）：
+现有部署形态：公共层配置 `share/opencode.json`（挂载到项目内即 `.opencode/opencode.json`）的 `plugin` 数组注册 **npm 包名**：
 
 ```jsonc
 {
@@ -32,7 +35,9 @@ opencode 插件：**会话生成原语**。只做一件事——**创建一个�
 }
 ```
 
-本地开发也可注册本地目录（opencode 按路径加载）：把 `index.js` + `package.json` 复制到自选目录，在 `plugin` 中写该目录相对路径（如 `./plugins/session-spawn`）。
+opencode 启动时自动把最新发布安装到包缓存 `~/.cache/opencode/packages/opencode-session-spawn/`（活实例为其中的 `node_modules/opencode-session-spawn/index.js`），**重启桌面版生效**。发布新版本后重启即自动更新；若缓存未刷新，删除 `~/.cache/opencode/packages/opencode-session-spawn@latest` 后重启强制重装。
+
+> 旧的本地目录注册写法（如 `./plugins/session-relay/`）已作废；开发与生产验证统一走 `test/test.mjs` + `RELAY_MAIN`（见下节）。
 
 ## 编排示例
 
@@ -55,11 +60,19 @@ E:\\proj\\handoff\\migration-3.md
 @spawn --agent leader --title "[P1-10] sprint" 读取 handoff/migration-3.md 后继续迁移任务
 ```
 
+父子回复约定（防环路）：父会话在起始语句里要求「子会话收尾 / 受阻时调用 `notify_parent`」；子会话执行：
+
+```
+notify_parent({ text: "P1-10 已完成，验收报告见 runs/P1-10-acceptance.md" })
+```
+
+父会话会收到一条 `[relay] …` 消息并以服务端默认模式被唤醒；收到通知后按需行动，**不要自动回发通知**（`notify_parent` 只向父会话发送，避免环路）。
+
 ## 开发与测试
 
 ```bash
 npm install          # 安装 devDependency @opencode-ai/plugin（唯一依赖，仅测试用）
-node test/test.mjs   # 23 用例 / 62 断言
+node test/test.mjs   # 34 用例 / 86 断言
 ```
 
 - `test/test.mjs` 默认经相对路径 `../index.js` 测项目版；环境变量 `RELAY_MAIN` 覆盖为其他路径（tarball 解包版 / 包缓存活实例）。`RELAY_MAIN` 目标须能向上解析到 `@opencode-ai/plugin`（解包放项目内即可）。

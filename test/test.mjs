@@ -12,15 +12,20 @@ function ok(name, cond) {
 }
 function section(t) { console.log(`\n== ${t} ==`); }
 
-// 假 client：记录 create / promptAsync / prompt 调用与 toast。
-function makeClient({ failCreate = false, failPrompt = false, noPromptAsync = false, noPrompt = false, noCreate = false } = {}) {
-  const calls = { create: [], promptAsync: [], prompt: [] };
+// 假 client：记录 create / promptAsync / prompt / get 调用与 toast。
+function makeClient({ failCreate = false, failPrompt = false, noPromptAsync = false, noPrompt = false, noCreate = false, noGet = false, failGet = false, parentID = "ses_parent_1" } = {}) {
+  const calls = { create: [], promptAsync: [], prompt: [], get: [] };
   const toasts = [];
   const session = {
     create: noCreate ? undefined : async (opts) => {
       calls.create.push(opts);
       if (failCreate) throw new Error("CREATE_FAIL");
       return { data: { id: "ses_new_1" } };
+    },
+    get: noGet ? undefined : async (arg) => {
+      calls.get.push(arg);
+      if (failGet) throw new Error("GET_FAIL");
+      return { data: { id: arg && arg.path && arg.path.id, parentID } };
     },
     promptAsync: noPromptAsync ? undefined : async (arg) => {
       calls.promptAsync.push(arg);
@@ -269,6 +274,115 @@ section("D. 源码级：旧接力机制零残留");
   ok("D1 无链状态(chains/sessionChain)", src.includes("sessionChain") === false && src.includes("chains") === false);
   ok("D1 无 fs 状态文件", src.includes('"handoff"') === false && src.includes("readFileSync") === false);
   ok("D1 无旧命令 status/leave/refresh/verify", /@relay\s+status|@relay\s+leave|@relay\s+refresh|@relay\s+verify/i.test(src) === false);
+}
+
+// ============ E. spawn_session 自动携带 parentID ============
+section("E. spawn_session 自动携带 parentID（context.sessionID）");
+
+{
+  // E1: 有 context.sessionID → create body.parentID 命中
+  const { client, calls } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks.tool.spawn_session.execute({ prompt: "x" }, ctx);
+  ok("E1 create body.parentID = context.sessionID", calls.create[0].body.parentID === "S");
+}
+
+{
+  // E2: context 缺失 → body 无 parentID 键
+  const { client, calls } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks.tool.spawn_session.execute({ prompt: "x" });
+  ok("E2 context 缺失 → body 无 parentID 键", !("parentID" in calls.create[0].body));
+}
+
+{
+  // E3: sessionID 空白 → body 无 parentID 键
+  const { client, calls } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks.tool.spawn_session.execute({ prompt: "x" }, { sessionID: "   " });
+  ok("E3 空白 sessionID → body 无 parentID 键", !("parentID" in calls.create[0].body));
+}
+
+// ============ F. 工具 notify_parent ============
+section("F. 工具 notify_parent（[relay] 注入父会话）");
+
+{
+  // F1: 契约
+  const { client } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  const t = hooks.tool && hooks.tool.notify_parent;
+  ok("F1 hooks.tool.notify_parent 存在", !!t);
+  ok("F1 有 description", t && typeof t.description === "string" && t.description.length > 0);
+  ok("F1 参数含 text", t && t.args && !!t.args.text);
+}
+
+{
+  // F2: 正常注入 → session.get 取自身 id、注入父 id、[relay] 前缀、无 agent
+  const { client, calls } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  const r = await hooks.tool.notify_parent.execute({ text: "B 已收到并回执" }, ctx);
+  ok("F2 session.get 传当前会话 id", calls.get[0] && calls.get[0].path.id === "S");
+  ok("F2 注入 path.id = parentID", calls.promptAsync[0].path.id === "ses_parent_1");
+  ok("F2 注入文本带 [relay] 前缀", calls.promptAsync[0].body.parts[0].text === "[relay] B 已收到并回执");
+  ok("F2 注入 body 无 agent", calls.promptAsync[0].body.agent === undefined);
+  ok("F2 返回串含父会话 id", typeof r === "string" && r.includes("ses_parent_1"));
+}
+
+{
+  // F3: 空文本 → 报错文本、不读会话不注入
+  const { client, calls } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  const r = await hooks.tool.notify_parent.execute({ text: "   " }, ctx);
+  ok("F3 空文本返回「通知失败：内容为空」", r === "通知失败：内容为空");
+  ok("F3 空文本不读会话不注入", calls.get.length === 0 && calls.promptAsync.length === 0);
+}
+
+{
+  // F4: 无父会话 → 报错文本、不注入
+  const { client, calls } = makeClient({ parentID: null });
+  const hooks = await SessionSpawn({ directory: ".", client });
+  const r = await hooks.tool.notify_parent.execute({ text: "x" }, ctx);
+  ok("F4 无父会话返回「当前会话没有父会话，无法通知」", r === "当前会话没有父会话，无法通知");
+  ok("F4 无父会话不注入", calls.promptAsync.length === 0);
+}
+
+{
+  // F5: promptAsync 缺失 → 回退 prompt
+  const { client, calls } = makeClient({ noPromptAsync: true });
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks.tool.notify_parent.execute({ text: "回退" }, ctx);
+  ok("F5 回退 prompt 1次", calls.prompt.length === 1);
+  ok("F5 回退 path.id = parentID", calls.prompt[0].path.id === "ses_parent_1");
+  ok("F5 回退文本带前缀", calls.prompt[0].body.parts[0].text === "[relay] 回退");
+}
+
+{
+  // F6: session.get 失败 → 报错文本（不抛）、不注入
+  const { client, calls } = makeClient({ failGet: true });
+  const hooks = await SessionSpawn({ directory: ".", client });
+  const r = await hooks.tool.notify_parent.execute({ text: "x" }, ctx);
+  ok("F6 get 失败返回错误文本（不抛）", typeof r === "string" && r.startsWith("通知失败："));
+  ok("F6 get 失败不注入", calls.promptAsync.length === 0);
+}
+
+{
+  // F7: 嵌套 B→A：以 B 的 sessionID 解析出 A 的 id
+  const { client, calls } = makeClient({ parentID: "ses_A" });
+  const hooks = await SessionSpawn({ directory: ".", client });
+  const r = await hooks.tool.notify_parent.execute({ text: "嵌套" }, { sessionID: "ses_B" });
+  ok("F7 以 B 的 id 读会话", calls.get[0].path.id === "ses_B");
+  ok("F7 注入到 A 的 id", calls.promptAsync[0].path.id === "ses_A");
+  ok("F7 返回串含 A 的 id", typeof r === "string" && r.includes("ses_A"));
+}
+
+// ============ G. 命令入口不带 parentID ============
+section("G. 命令 @spawn（人工语义，不带 parentID）");
+
+{
+  const { client, calls } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks["chat.message"]({ sessionID: "S" }, { parts: [{ type: "text", text: "@spawn 人工语义" }] });
+  ok("G1 @spawn create 不带 parentID", calls.create.length === 1 && !("parentID" in calls.create[0].body));
 }
 
 console.log(`\n==== 结果: ${pass} 通过, ${fail} 失败 ====`);

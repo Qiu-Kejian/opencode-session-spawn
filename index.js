@@ -1,19 +1,23 @@
 import { tool } from "@opencode-ai/plugin/tool";
 
 /**
- * session-spawn —— 会话生成原语（v2.1.1，2026-09-12 起支持 agent/directory）
+ * session-spawn —— 会话生成原语（v2.2.0，2026-09-15 起支持 parentID / notify_parent 反向通知）
  *
- * 只做一件事：创建一个新的顶层会话，并把起始语句注入为该会话首条消息。
- *   create: client.session.create({ body: { title }, query: { directory } })
- *   inject: client.session.promptAsync({ path: { id }, body: { agent, parts: [{ type: "text", text }] } })
- *   （agent / directory 均可选，仅在显式传入且非空白时透传；不做校验，交服务端）
+ * 只做两件事：
+ *   1. 创建一个新的顶层会话，并把起始语句注入为该会话首条消息。
+ *      create: client.session.create({ body: { title, parentID? }, query: { directory } })
+ *      inject: client.session.promptAsync({ path: { id }, body: { agent, parts: [{ type: "text", text }] } })
+ *      （agent / directory / parentID 均可选，仅在显式传入且非空白时透传；不做校验，交服务端）
+ *   2. 子会话向父会话注入一条 [relay] 消息并唤醒它（工具 notify_parent；仅父会话，无任意会话注入）。
  *
  * 设计约束（用户定稿）：
- *   - 插件只负责「建会话 + 注入语句」，不落文书、不读文书、不追踪链、无状态文件。
+ *   - 插件只负责「建会话 + 注入语句 + 父会话通知」，不落文书、不读文书、不追踪链、无状态文件。
  *   - 编排中若需交接文书，由调用方把「读取文书路径」等引导写进起始语句即可（与其他工具天然兼容）。
  *   - 优先 promptAsync（异步 fire-and-forget，不阻塞父会话）；缺失则回退同步 prompt。
  *   - 两个入口共用同一 spawn()：① 工具 spawn_session（模型自主触发，打通无人值守）
  *                                        ② 命令 @spawn / @relay spawn（人工触发）。
+ *   - spawn_session 自动把调用者会话 id 写入新会话 parentID；notify_parent 只沿 parentID 上行，
+ *     不提供任意 session id 参数、无重试 / 队列 / 追踪（保持无状态原语）。
  *
  * 历史：本仓库前身 session-relay 的接力链、两阶段文书、空闲事件驱动、哨兵等机制已全部移除。
  */
@@ -87,7 +91,7 @@ export const SessionSpawn = async (ctx) => {
   };
 
   // 核心：建新会话 + 注入起始语句。
-  // opts.agent / opts.directory 可选；仅在非空白时透传（不做校验，交服务端）。
+  // opts.agent / opts.directory / opts.parentID 可选；仅在非空白时透传（不做校验，交服务端）。
   // 返回 { id, title, injected, agent?, directory?, error? }；create 失败则抛出（未建会话）。
   async function spawn(prompt, title, opts = {}) {
     const text = typeof prompt === "string" ? prompt : "";
@@ -98,8 +102,10 @@ export const SessionSpawn = async (ctx) => {
     const t = (title && String(title).trim()) || defaultTitle(text);
     const agent = nonEmpty(opts.agent);
     const directory = nonEmpty(opts.directory);
+    const parentID = nonEmpty(opts.parentID);
 
     const createReq = { body: { title: t } };
+    if (parentID !== undefined) createReq.body.parentID = parentID;
     if (directory !== undefined) createReq.query = { directory };
     const created = await client.session.create(createReq);
     const id = created && (created.data?.id || created.id);
@@ -138,9 +144,13 @@ export const SessionSpawn = async (ctx) => {
           agent: tool.schema.string().optional().describe("新会话以某 agent/模式启动（如 leader）；缺省由服务端默认"),
           directory: tool.schema.string().optional().describe("新会话绑定的项目目录（绝对路径，如 D:\\dev\\bbcare）；缺省由服务端默认"),
         },
-        async execute(args) {
+        async execute(args, context) {
           try {
-            const r = await spawn(args.prompt, args.title, { agent: args.agent, directory: args.directory });
+            const r = await spawn(args.prompt, args.title, {
+              agent: args.agent,
+              directory: args.directory,
+              parentID: context && context.sessionID,
+            });
             if (!r.injected) {
               return `会话「${r.title}」(id=${r.id}) 已创建，但起始语句注入失败：${r.error}。请手动打开该会话补发指令。`;
             }
@@ -148,6 +158,47 @@ export const SessionSpawn = async (ctx) => {
           } catch (e) {
             return `创建会话失败：${e.message}`;
           }
+        },
+      }),
+
+      // 工具：子会话反向通知父会话（沿 parentID 上行；失败一律返回文本，不抛）。
+      notify_parent: tool({
+        description:
+          "向本会话的父会话（spawn 本会话的会话）注入一条消息并唤醒它：用于子会话完成 / 受阻时通知父会话。仅能通知父会话，不支持指定任意会话；注入文本自动加 [relay] 前缀；父会话以服务端默认模式（build）被唤醒。收到通知后按需行动即可，不要自动回发通知（防环路）。",
+        args: {
+          text: tool.schema.string().describe("通知内容（注入父会话，自动加 [relay] 前缀）"),
+        },
+        async execute(args, context) {
+          const text = typeof args.text === "string" ? args.text : "";
+          if (!text.trim()) return "通知失败：内容为空";
+          if (!client || !client.session || typeof client.session.get !== "function") {
+            return "通知失败：client.session.get 不可用";
+          }
+
+          let parentID;
+          try {
+            const got = await client.session.get({ path: { id: context && context.sessionID } });
+            parentID = got && ((got.data && got.data.parentID) || got.parentID);
+          } catch (e) {
+            return `通知失败：读取会话失败（${e.message}）`;
+          }
+          if (!parentID) return "当前会话没有父会话，无法通知";
+
+          const body = { parts: [{ type: "text", text: "[relay] " + text }] };
+          const injectFn =
+            typeof client.session.promptAsync === "function"
+              ? client.session.promptAsync.bind(client.session)
+              : typeof client.session.prompt === "function"
+                ? client.session.prompt.bind(client.session)
+                : null;
+          if (!injectFn) return "通知失败：client.session.promptAsync/prompt 均不可用";
+
+          try {
+            await injectFn({ path: { id: parentID }, body });
+          } catch (e) {
+            return `通知失败：注入父会话失败（${e.message}）`;
+          }
+          return `已通知父会话 (id=${parentID})。`;
         },
       }),
     },
