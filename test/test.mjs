@@ -13,7 +13,7 @@ function ok(name, cond) {
 function section(t) { console.log(`\n== ${t} ==`); }
 
 // 假 client：记录 create / promptAsync / prompt / get 调用与 toast。
-function makeClient({ failCreate = false, failPrompt = false, noPromptAsync = false, noPrompt = false, noCreate = false, noGet = false, failGet = false, parentID = "ses_parent_1" } = {}) {
+function makeClient({ failCreate = false, failPrompt = false, noPromptAsync = false, noPrompt = false, noCreate = false, noGet = false, failGet = false, parentID = null, spawnParentID = "ses_parent_1" } = {}) {
   const calls = { create: [], promptAsync: [], prompt: [], get: [] };
   const toasts = [];
   const session = {
@@ -25,7 +25,8 @@ function makeClient({ failCreate = false, failPrompt = false, noPromptAsync = fa
     get: noGet ? undefined : async (arg) => {
       calls.get.push(arg);
       if (failGet) throw new Error("GET_FAIL");
-      return { data: { id: arg && arg.path && arg.path.id, parentID } };
+      const metadata = spawnParentID ? { spawnParentID } : undefined;
+      return { data: { id: arg && arg.path && arg.path.id, parentID, metadata } };
     },
     promptAsync: noPromptAsync ? undefined : async (arg) => {
       calls.promptAsync.push(arg);
@@ -57,6 +58,7 @@ section("A. 工具 spawn_session（create + promptAsync 注入）");
   ok("A1 有 description", t && typeof t.description === "string" && t.description.length > 0);
   ok("A1 参数含 prompt", t && t.args && !!t.args.prompt);
   ok("A1 参数含可选 title", t && t.args && !!t.args.title);
+  ok("A1 参数含可选 model", t && t.args && !!t.args.model);
   ok("A1 execute 为函数", t && typeof t.execute === "function");
 }
 
@@ -276,31 +278,32 @@ section("D. 源码级：旧接力机制零残留");
   ok("D1 无旧命令 status/leave/refresh/verify", /@relay\s+status|@relay\s+leave|@relay\s+refresh|@relay\s+verify/i.test(src) === false);
 }
 
-// ============ E. spawn_session 自动携带 parentID ============
-section("E. spawn_session 自动携带 parentID（context.sessionID）");
+// ============ E. spawn_session 保持顶层 + metadata 父链接 ============
+section("E. spawn_session 顶层会话 + metadata.spawnParentID");
 
 {
-  // E1: 有 context.sessionID → create body.parentID 命中
+  // E1: 有 context.sessionID → create body.metadata.spawnParentID 命中，且不带 parentID（保持顶层可见）
   const { client, calls } = makeClient();
   const hooks = await SessionSpawn({ directory: ".", client });
   await hooks.tool.spawn_session.execute({ prompt: "x" }, ctx);
-  ok("E1 create body.parentID = context.sessionID", calls.create[0].body.parentID === "S");
+  ok("E1 create body.metadata.spawnParentID = context.sessionID", calls.create[0].body.metadata && calls.create[0].body.metadata.spawnParentID === "S");
+  ok("E1 create body 无 parentID（保持顶层）", !("parentID" in calls.create[0].body));
 }
 
 {
-  // E2: context 缺失 → body 无 parentID 键
+  // E2: context 缺失 → body 无 metadata 键
   const { client, calls } = makeClient();
   const hooks = await SessionSpawn({ directory: ".", client });
   await hooks.tool.spawn_session.execute({ prompt: "x" });
-  ok("E2 context 缺失 → body 无 parentID 键", !("parentID" in calls.create[0].body));
+  ok("E2 context 缺失 → body 无 metadata 键", !("metadata" in calls.create[0].body));
 }
 
 {
-  // E3: sessionID 空白 → body 无 parentID 键
+  // E3: sessionID 空白 → body 无 metadata 键
   const { client, calls } = makeClient();
   const hooks = await SessionSpawn({ directory: ".", client });
   await hooks.tool.spawn_session.execute({ prompt: "x" }, { sessionID: "   " });
-  ok("E3 空白 sessionID → body 无 parentID 键", !("parentID" in calls.create[0].body));
+  ok("E3 空白 sessionID → body 无 metadata 键", !("metadata" in calls.create[0].body));
 }
 
 // ============ F. 工具 notify_parent ============
@@ -322,10 +325,19 @@ section("F. 工具 notify_parent（[relay] 注入父会话）");
   const hooks = await SessionSpawn({ directory: ".", client });
   const r = await hooks.tool.notify_parent.execute({ text: "B 已收到并回执" }, ctx);
   ok("F2 session.get 传当前会话 id", calls.get[0] && calls.get[0].path.id === "S");
-  ok("F2 注入 path.id = parentID", calls.promptAsync[0].path.id === "ses_parent_1");
+  ok("F2 注入 path.id = metadata.spawnParentID", calls.promptAsync[0].path.id === "ses_parent_1");
   ok("F2 注入文本带 [relay] 前缀", calls.promptAsync[0].body.parts[0].text === "[relay] B 已收到并回执");
   ok("F2 注入 body 无 agent", calls.promptAsync[0].body.agent === undefined);
   ok("F2 返回串含父会话 id", typeof r === "string" && r.includes("ses_parent_1"));
+}
+
+{
+  // F2b: 旧会话兼容：无 metadata → 回退 parentID
+  const { client, calls } = makeClient({ spawnParentID: null, parentID: "ses_parent_legacy" });
+  const hooks = await SessionSpawn({ directory: ".", client });
+  const r = await hooks.tool.notify_parent.execute({ text: "旧" }, ctx);
+  ok("F2b 无 metadata → 回退 parentID 注入", calls.promptAsync[0] && calls.promptAsync[0].path.id === "ses_parent_legacy");
+  ok("F2b 返回串含 id", typeof r === "string" && r.includes("ses_parent_legacy"));
 }
 
 {
@@ -338,8 +350,8 @@ section("F. 工具 notify_parent（[relay] 注入父会话）");
 }
 
 {
-  // F4: 无父会话 → 报错文本、不注入
-  const { client, calls } = makeClient({ parentID: null });
+  // F4: 无父会话（metadata 与 parentID 均无）→ 报错文本、不注入
+  const { client, calls } = makeClient({ spawnParentID: null, parentID: null });
   const hooks = await SessionSpawn({ directory: ".", client });
   const r = await hooks.tool.notify_parent.execute({ text: "x" }, ctx);
   ok("F4 无父会话返回「当前会话没有父会话，无法通知」", r === "当前会话没有父会话，无法通知");
@@ -367,7 +379,7 @@ section("F. 工具 notify_parent（[relay] 注入父会话）");
 
 {
   // F7: 嵌套 B→A：以 B 的 sessionID 解析出 A 的 id
-  const { client, calls } = makeClient({ parentID: "ses_A" });
+  const { client, calls } = makeClient({ spawnParentID: "ses_A" });
   const hooks = await SessionSpawn({ directory: ".", client });
   const r = await hooks.tool.notify_parent.execute({ text: "嵌套" }, { sessionID: "ses_B" });
   ok("F7 以 B 的 id 读会话", calls.get[0].path.id === "ses_B");
@@ -375,14 +387,49 @@ section("F. 工具 notify_parent（[relay] 注入父会话）");
   ok("F7 返回串含 A 的 id", typeof r === "string" && r.includes("ses_A"));
 }
 
-// ============ G. 命令入口不带 parentID ============
-section("G. 命令 @spawn（人工语义，不带 parentID）");
+// ============ G. 命令入口不带父链接 ============
+section("G. 命令 @spawn（人工语义，不带父链接）");
 
 {
   const { client, calls } = makeClient();
   const hooks = await SessionSpawn({ directory: ".", client });
   await hooks["chat.message"]({ sessionID: "S" }, { parts: [{ type: "text", text: "@spawn 人工语义" }] });
-  ok("G1 @spawn create 不带 parentID", calls.create.length === 1 && !("parentID" in calls.create[0].body));
+  ok("G1 @spawn create 不带 parentID/metadata", calls.create.length === 1 && !("parentID" in calls.create[0].body) && !("metadata" in calls.create[0].body));
+}
+
+// ============ H. 可选 model 参数 ============
+section("H. spawn_session model 参数（provider/model）");
+
+{
+  // H1: deepseek/deepseek-v4-flash → { providerID, id }
+  const { client, calls } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks.tool.spawn_session.execute({ prompt: "x", model: "deepseek/deepseek-v4-flash" }, ctx);
+  ok("H1 model 解析 providerID/id", calls.create[0].body.model && calls.create[0].body.model.providerID === "deepseek" && calls.create[0].body.model.id === "deepseek-v4-flash");
+}
+
+{
+  // H2: opencode/big-pickle → { providerID: "opencode", id: "big-pickle" }
+  const { client, calls } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks.tool.spawn_session.execute({ prompt: "x", model: "opencode/big-pickle" }, ctx);
+  ok("H2 opencode/big-pickle 解析", calls.create[0].body.model && calls.create[0].body.model.providerID === "opencode" && calls.create[0].body.model.id === "big-pickle");
+}
+
+{
+  // H3: 空白 model → 视为未传
+  const { client, calls } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks.tool.spawn_session.execute({ prompt: "x", model: "   " }, ctx);
+  ok("H3 空白 model 视为未传", !("model" in calls.create[0].body));
+}
+
+{
+  // H4: 非法 model（无 "/"）→ 忽略
+  const { client, calls } = makeClient();
+  const hooks = await SessionSpawn({ directory: ".", client });
+  await hooks.tool.spawn_session.execute({ prompt: "x", model: "no-slash" }, ctx);
+  ok("H4 非法 model（无 /）忽略", !("model" in calls.create[0].body));
 }
 
 console.log(`\n==== 结果: ${pass} 通过, ${fail} 失败 ====`);

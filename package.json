@@ -1,6 +1,6 @@
 {
   "name": "opencode-session-spawn",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "type": "module",
   "description": "opencode 会话生成原语：创建新顶层会话并注入起始语句，用于无人值守长任务编排（工具 spawn_session + 命令 @spawn）。",
   "main": "index.js",
